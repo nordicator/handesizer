@@ -6,19 +6,28 @@ class StandaloneSynth:
     def __init__(self):
         # Explicitly configure: 0 input channels, 2 output channels, duplex off
         self.s = Server(sr=44100, nchnls=2, ichnls=0, duplex=0)
-        
-        # Force it to use the default system output device
         self.s.setOutputDevice(pa_get_default_output())
-        
         self.s.boot()
         self.s.start()
 
-        # Create your oscillator at a baseline volume of 0.3
-        self.osc = SuperSaw(freq=220, detune=0.5, mul=0.3) 
+        self.effects_list = ["filter", "reverb", "modulation"]
+        self.effect_index = 0
+        self.current_mode = self.effects_list[self.effect_index]
 
-        # We append .out() to the filter, but we initialize it with mul=0 (silent)
-        # This acts as our master gate!
-        self.synth_filter = MoogLP(input=self.osc, freq=1000, res=0.5, mul=0).out()
+        # Create your oscillator at a baseline volume of 0.3
+        self.saw_osc = SuperSaw(freq=220, detune=0.5, mul=0.3) 
+        self.square_osc = LFO(freq=220, type=2, mul=0.3)
+        self.sine_osc = Sine(freq=220, mul=0.3)
+
+        self.active_soruce = Selector([self.saw_osc, self.square_osc, self.sine_osc], voice=0)
+
+
+        self.filter = MoogLP(input=self.active_soruce, freq=1000, res=0.5, mul=0)
+        self.reverb = Freeverb(input=self.filter, size=0.6, damp=0.5, bal=0.0)
+        self.chorus = Chorus(input=self.reverb, depth=1, feedback=0.25, bal=0.0)
+        self.final_output = self.chorus.out()
+
+
 
         self.midi_thread = threading.Thread(target=self._midi_listener, daemon=True)
         self.midi_thread.start()
@@ -36,23 +45,45 @@ class StandaloneSynth:
                 with mido.open_input(port_name, virtual=False) as inport:
                     print(f"Connected to Akai on port: {port_name}")
                     for msg in inport:
-                        if msg.type == 'note_on':
+                        if msg.type == 'note_on' and msg.channel == 0:
                             freq = 440.0 * (2.0 ** ((msg.note - 69) / 12.0))
-                           
-                           
-                            self.osc.setFreq(freq)
-                            # Open the volume gate on the filter output
-                            self.synth_filter.setMul(0.4) 
-                        elif msg.type == 'note_off':
+                            self.saw_osc.setFreq(freq)
+                            self.square_osc.setFreq(freq)
+                            self.sine_osc.setFreq(freq)
+                            self.filter.setMul(0.4)
+
+                        elif msg.type == 'note_off' and msg.channel == 0:
                             # Shut the volume gate on the filter output
-                            self.synth_filter.setMul(0)   
+                            self.filter.setMul(0) 
+                        
+                        elif msg.type == 'note_on' and msg.channel == 9:
+                            if msg.note == 36:
+                                self.active_soruce.setVoice(0) 
+                                print("bank switch: supersaw active")
+                            elif msg.note == 37: 
+                                self.active_soruce.setVoice(1)
+                                print("Bank Switch: Square Wave Active")
+                            elif msg.note == 38: 
+                                self.active_soruce.setVoice(2)
+                                print("Bank Switch: Sine Wave Active")
+
             except Exception as e:
                 print(f"MIDI Error: {e}")
-        else:
-            print("Akai MPK Mini not found in system ports. Running in hand-only mode.")
+        
+    def cycle_effect_mode(self):
+        """Triggered by a quick single pinch to cycle active fx type"""
+        self.effect_index = (self.effect_index + 1) % len(self.effects_list)
+        self.current_mode = self.effects_list[self.effect_index]
+        print(f"effect selected: {self.current_mode.upper()}")
+        
+    def tweak_effect_knob(self, normalized_rotation):
+        percentage = int(normalized_rotation * 100)
+        if self.current_mode == "filter":
+            cutoff = (normalized_rotation * 4940) + 60
+            self.filter.setFreq(cutoff)
+        elif self.current_mode == "reverb":
+            self.reverb.setBal(normalized_rotation * 0.8)
+        elif self.current_mode == "modulation":
+            self.chorus.setBal(normalized_rotation * 0.9)
 
-    def modulate_filter(self, normalized_value):
-        """Accepts a value from 0.0 to 1.0 from the hand tracker to tweak the sound"""
-        # Map to an audible filter frequency sweep range (100Hz to 6000Hz)
-        cutoff = (normalized_value * 5900) + 100
-        self.synth_filter.setFreq(cutoff)
+        return percentage
